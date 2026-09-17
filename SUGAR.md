@@ -392,8 +392,53 @@ tmux new -s tensorboard -d \
 本机看：
 
 ```bash
-ssh -N -L 6006:localhost:6006 Noetix-0
-# 浏览器打开 http://127.0.0.1:6006
+ssh -N -L 16006:localhost:6006 Noetix-0
+# 浏览器打开 http://127.0.0.1:16006
 ```
 
+> 本机端口选 `16006` 而不是 `6006`：本机 `6006~6010` 这几个端口当时全被 VS Code 占用了（`ss -lntp` 查出来的），换成大家都不会用的端口最省事，不用先去杀谁占用的进程。
+
 终端级别的日志在 `logs/train_{TASK}.log`（`launch_all_tasks.sh` 用 `tee` 写的），可以直接 `tail -f` 看 `Metrics/motion/error_obj_pos`、`Episode_Reward/hoi_contact`、`Episode_Termination/obj_pos` 这几个最能反映"抓没抓稳"的指标，不用只看 reward 曲线。
+
+### 5.7 服务器上实际踩到的两个坑
+
+**1. `isaacsim.asset.importer.urdf` 报 `ERROR_INCOMPATIBLE_DRIVER` / Vulkan 初始化失败**
+
+`inference.sh`/`train.sh` 第一次在服务器上跑时报了一堆：
+
+```text
+[Error] [carb.graphics-vulkan.plugin] VkResult: ERROR_INCOMPATIBLE_DRIVER
+[Error] [gpu.foundation.plugin] Failed to create any GPU devices
+```
+
+排查发现是系统级 Vulkan loader 包 `libvulkan1` 没装（`find /usr/lib -iname 'libvulkan.so*'` 完全找不到，`ldconfig -p | grep vulkan` 也是空的）——NVIDIA 驱动、ICD json（`/etc/vulkan/icd.d/nvidia_icd.json`）、`libGLX_nvidia.so.0` 都在，就是缺这层 loader 胶水层。修复：
+
+```bash
+unset http_proxy https_proxy   # apt 走的是云厂商内网镜像，不能走代理
+apt-get install -y libvulkan1
+```
+
+装完后 `ERROR_INCOMPATIBLE_DRIVER` 消失，换成一批 "Driver Version: 0 / GPUs do not support RayTracing / GPU Foundation is not initialized" 的警告——这些是 Kit 的**可视化渲染子系统**在纯计算节点上天生用不了（没有显示输出，RT 核心探测不到），跟 PhysX 物理仿真是两条完全独立的路径。用一次 50-iteration 的 Refiner 冒烟测试直接验证过：GPU 利用率能到 56~62%、iteration 时间 2.8s，物理仿真确确实实在用 GPU，这些渲染报错可以放心当噪音忽略，不影响训练。
+
+**2. 六任务同时启动，几个任务几秒内报一堆不相关的错**
+
+第一次用 `launch_all_tasks.sh` 六个任务同时拉起来，PushBox/StandBottle 正常，另外四个（CarryBox/KickBox/PickBottle/SitChair）几秒内就把 `train.sh` 的 Refiner→rollout→Tracker→rollout→Generator 七步全部"跑"完了，报的错五花八门（`FileNotFoundError: tracker.pt`、`KeyError('obj_pos_b')`……）看起来毫不相关。
+
+去查第一个任务（CarryBox）日志里**真正**的第一个 traceback，根因是：
+
+```text
+ValueError: No contact sensors added to the prim: '/World/envs/env_0/Robot'.
+Unresolved reference prim path ...g1_29dof_rev_1_0_with_rubber_hand.usd@<defaultPrim>...
+```
+
+六个进程同时对 G1 URDF 做运行时 URDF→USD 转换（写到 `/tmp/IsaacLab/usd_<timestamp>_<id>/`），资源竞争导致部分转换产物是坏的（USD 里 `defaultPrim` 引用解析不到，机器人身上一个刚体都没挂上），场景创建直接抛异常。而官方 `train.sh` **没有 `set -e`**，Refiner 这步崩了之后不会停，会带着不存在的 checkpoint/数据文件继续往后跑完剩下六步，每一步都秒级失败，看起来像一堆互不相干的报错，其实全是同一个根因的级联产物。
+
+修复两处：
+- `train.sh` 开头加了 `set -e`，以后任何一步真的失败会立刻停，不会再级联出一堆迷惑性报错。
+- `launch_all_tasks.sh` 六个任务改成**错峰启动**，每起一个 `sleep 30` 再起下一个，让每个任务先跑过 URDF→USD 转换 + 建场这个约 15~20 秒的窗口再让下一个开始抢资源。
+
+错峰重启后六个任务全部正常：GPU0~5 利用率 47~61%，显存 7~10GB，都有真实递增的 `Learning iteration`。这两处修复已经提交进仓库（`train.sh`、`launch_all_tasks.sh`），以后重新跑不会再复现。
+
+**3.（小坑）`~/.bashrc` 里的 `[ -z "$PS1" ] && return`**
+
+非交互 SSH 命令（`ssh host "some command"`）里 `source ~/.bashrc` 会在这一行直接 return，后面写的代理环境变量、conda init 全部不会生效——`git fetch`/`pip` 等命令表现得像没配代理一样卡死。非交互命令里不要指望 `source ~/.bashrc` 生效，要么在命令里显式 `export http_proxy=...`，要么用 `bash -lc "..."`（login shell 会走 `.bash_profile`/`.profile`，不会踩这个 return）。
