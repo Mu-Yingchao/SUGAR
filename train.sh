@@ -1,4 +1,8 @@
 
+# 原脚本没有 set -e：某一步失败（比如 GPU 资源竞争导致的场景创建失败）不会中止，
+# 会带着缺失的 checkpoint/数据继续跑完后面几步，几秒内产生一堆看起来不相关的报错。
+set -e
+
 TASK_NAME=$1
 CURRENT_TIME=$(date +"%Y%m%d_%H%M%S")
 EXP_NAME=${2:-$CURRENT_TIME}

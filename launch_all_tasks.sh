@@ -21,6 +21,10 @@ for i in "${!TASKS[@]}"; do
        export CUDA_VISIBLE_DEVICES=${GPU} && \
        bash train.sh ${TASK} server_repro 2>&1 | tee logs/train_${TASK}.log"
     echo "launched ${TASK} on GPU${GPU} in tmux session ${SESSION}"
+    # 6 个任务同时启动会一起抢 G1 URDF->USD 运行时转换的资源，容易有一两个因为
+    # 场景创建失败而崩掉（ValueError: No contact sensors added...）。错峰启动，
+    # 让每个任务先跑过这段 ~20s 的转换/建场窗口再让下一个开始。
+    sleep 30
 done
 
 echo
