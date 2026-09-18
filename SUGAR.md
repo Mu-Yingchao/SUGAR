@@ -584,13 +584,21 @@ rsync -ah -e "ssh -i /home/yingchaomu/下载/Noetix-2-7.pem" \
 
 ### 7.5 MuJoCo sim2sim 部署代码：`sugar_deploy`（独立仓库）
 
-7.1 节说的"能 play 但没开源 sim-to-sim"——这个缺口已经动手补了一版，单独放在
-`/home/yingchaomu/下载/sugar_deploy`（不塞进 SUGAR 训练仓库，原因和详细说明见它自己的 README）。
+7.1 节说的"能 play 但没开源 sim-to-sim"——这个缺口已经动手补了一版，独立仓库
+`https://github.com/Mu-Yingchao/sugar_deploy`（本机 `/home/yingchaomu/下载/sugar_deploy`，不塞进
+SUGAR 训练仓库，原因见它自己 README）。
 
 用官方 `demo_ckpts/CarryBox` 实测过：两个 checkpoint（`tracker.pt` + `generator.ckpt`）都能正确加载，
 整条 Tracker/Generator 数据流跑得通，物理数值稳定（修过一次显式 Euler 积分器 + 偏硬 PD 增益导致的数值
-发散）。**目前机器人还站不稳**（~1 秒内瘫软倒地），大概率是箱子尺寸/目标位置占位值不准确，具体排查
-思路在 `sugar_deploy/README.md` 的"已知问题 / 下一步排查"一节。
+发散）。**机器人现在能站稳了**：3 秒仿真（150 控制步）`pelvis_z` 稳定在 0.78~0.79，不再瘫软倒地——
+之前一直摔倒的根因是**关节顺序错了**，`contract.py` 早期按 G1 URDF 文件声明顺序推断的关节顺序，和
+IsaacLab 运行时真实用的顺序完全不一样（2026-09-18 跑本机 GUI `inference.sh` 时日志里刚好打出了真实
+顺序，才发现这个偏差；改正后连带修了一个因此暴露出来的第二个 bug：MuJoCo 执行器扭矩写入原来是按位置
+写的，隐含假设了顺序对齐，实际不对齐）。当前主要待解决的是**箱子没被稳定抓住**（会掉到地上），大概率
+是箱子尺寸/位置占位值不准确，具体排查思路在 `sugar_deploy/README.md` 的"已知问题 / 下一步排查"一节。
+
+这次教训也印证了原指南反复强调的一点：**关节顺序这类契约只要有条件就要从跑起来的系统里实测拿到，不要
+相信任何基于 URDF/MJCF/代码的静态推断**——两者不一致时不会报错，只会让策略表现得莫名其妙地烂。
 
 关节顺序、PD 增益、观测组成、36 维 command 结构这些契约，都是逐条从 SUGAR 源码核实出来的，来源标注
 在 `sugar_deploy/contract.py`；Generator 部分直接复用了 SUGAR 自己 `play.py` 在用的
