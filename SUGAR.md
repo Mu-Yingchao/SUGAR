@@ -567,3 +567,18 @@ rsync -ah -e "ssh -i /home/yingchaomu/下载/Noetix-2-7.pem" \
 ```
 
 **现在能跑这条命令的前提**：`train.sh` 对应任务要跑完全部三个阶段（Refiner→Tracker→Generator）。目前（见第 6 节）六个任务都还在 Refiner 阶段（50~57%），预计还要 8~12 小时才能进入 Tracker，全部跑完大概还要 1.5~2 天（见 3.4 节的算力估算）。中途也可以用 Refiner/Tracker 阶段各自产出的 rollout 数据做检查，但 `inference.sh` 这条完整推理链路要等 Generator 训完才有意义（它需要 `generator.ckpt`）。
+
+### 7.4 MuJoCo sim2sim 部署代码：`sugar_deploy`（独立仓库）
+
+7.1 节说的"能 play 但没开源 sim-to-sim"——这个缺口已经动手补了一版，单独放在
+`/home/yingchaomu/下载/sugar_deploy`（不塞进 SUGAR 训练仓库，原因和详细说明见它自己的 README）。
+
+用官方 `demo_ckpts/CarryBox` 实测过：两个 checkpoint（`tracker.pt` + `generator.ckpt`）都能正确加载，
+整条 Tracker/Generator 数据流跑得通，物理数值稳定（修过一次显式 Euler 积分器 + 偏硬 PD 增益导致的数值
+发散）。**目前机器人还站不稳**（~1 秒内瘫软倒地），大概率是箱子尺寸/目标位置占位值不准确，具体排查
+思路在 `sugar_deploy/README.md` 的"已知问题 / 下一步排查"一节。
+
+关节顺序、PD 增益、观测组成、36 维 command 结构这些契约，都是逐条从 SUGAR 源码核实出来的，来源标注
+在 `sugar_deploy/contract.py`；Generator 部分直接复用了 SUGAR 自己 `play.py` 在用的
+`GeneratorWrapper`，没有重新实现（过程中发现训练 yaml 写的是 `DDIMScheduler`，但实际推理路径用的是
+`DDPMScheduler`，自己重新拼一遍很容易在这类细节上出错）。
