@@ -442,3 +442,128 @@ Unresolved reference prim path ...g1_29dof_rev_1_0_with_rubber_hand.usd@<default
 **3.（小坑）`~/.bashrc` 里的 `[ -z "$PS1" ] && return`**
 
 非交互 SSH 命令（`ssh host "some command"`）里 `source ~/.bashrc` 会在这一行直接 return，后面写的代理环境变量、conda init 全部不会生效——`git fetch`/`pip` 等命令表现得像没配代理一样卡死。非交互命令里不要指望 `source ~/.bashrc` 生效，要么在命令里显式 `export http_proxy=...`，要么用 `bash -lc "..."`（login shell 会走 `.bash_profile`/`.profile`，不会踩这个 return）。
+
+---
+
+## 6. 训练效果评估：怎么看、看到了什么
+
+### 6.1 官方评估方式（已核实，不是猜的）
+
+`rsl_rl`（Refiner/Tracker）和 `sugar_il` 的 `accelerate`（Generator）都**默认写 TensorBoard**，不用 wandb 账号。终端每个 iteration 打印一份统计表，但只能看"最新一条"；要看趋势必须拉 TensorBoard 的时间序列。TensorBoard 本身有个 HTTP 数据接口，不一定非要开浏览器，也可以直接 `curl` 拉数值做自动化分析：
+
+```bash
+# 本机开着到 16006 的隧道（见 5.6），直接查询某个 run 某个 tag 的完整时间序列
+curl -s "http://127.0.0.1:16006/data/plugin/scalars/scalars?run=CarryBox_server_repro%2Flogs%2Frefiner&tag=Train%2Fmean_reward"
+```
+
+返回是 `[[wall_time, step, value], ...]` 的 JSON 数组，可以直接拿 Python/`jq` 处理，比人肉盯着 TensorBoard 网页方便，也适合写进自动化的健康检查脚本。
+
+### 6.2 该看哪几个 tag
+
+不要只看 `Train/mean_reward`——reward 数值本身容易被"刷分"，真正说明任务有没有做成的是：
+
+| Tag | 含义 | 怎么解读 |
+|---|---|---|
+| `Episode_Termination/trajectory_complete` | 完整跑完整条参考轨迹而不是中途失败终止的回合比例 | **最重要的单一指标**，直接反映"任务真的做成了"；应该从 0 持续爬升到接近 1 |
+| `Episode_Reward/hoi_contact` | human-object-interaction 接触奖励 | 应该持续上升，反映"真的抓/推/踢到了物体"而不是打空气 |
+| `Metrics/motion/error_obj_pos` / `error_obj_rot` | 物体位置/姿态追踪误差 | **训练初期数值小是假象**：回合几步就终止，误差只算了很短一段；等 `trajectory_complete` 涨起来之后，这个误差才是对完整轨迹的真实评估，数值这时候不降反升不代表变差，是统计口径变了（分母从"几步"变成"全程"） |
+| `Episode_Termination/obj_pos` | 因为"物体丢了/位置超差"而终止的回合比例 | 应该持续下降，这个如果一直很高说明物体总是被弄丢/推飞 |
+
+### 6.3 目前（Refiner 训练约 11.5 小时，进度 50~57%）的实测结果
+
+```text
+                    Mean reward (iter 18 → 现在)          trajectory_complete (iter 18 → 现在)
+CarryBox       ~0 → 19.5（涨幅趋缓）                       0% → 90.5%
+KickBox        ~0 → 25.4（涨势最猛）                       0% → 93.7%
+PushBox        ~0 → 25.2（趋于平稳）                        0% → 97.3%
+PickBottle     ~0 → 15.1                                  0% → 95.9%
+StandBottle    ~0 → 17.9                                  0% → 75.7%（最难，仍在持续爬升，没有停滞）
+SitChair       ~0 → 18.3                                  0% → 97.1%
+```
+
+六个任务全部从"训练刚开始几步就失败"涨到 75%+ 的轨迹完整率，是健康的 PPO 学习曲线，没有发散/停滞/reward hacking 的迹象。StandBottle 明显是六个任务里最难的一个，但也在持续进步（29%→76%），不是卡住了。
+
+---
+
+## 7. 部署指南
+
+### 7.1 先厘清一个概念："Play" ≠ Sim-to-sim ≠ Sim-to-real
+
+你问"官方没开源 sim-to-sim，那能不能 play"——这两件事完全不冲突，是三个不同层次的东西：
+
+| 层次 | 是什么 | SUGAR 官方开源了吗 |
+|---|---|---|
+| **Play（推理）** | 在 **训练用的同一个 IsaacSim 仿真器**里跑训练好的策略，看它能不能完成任务 | ✅ 开源了，就是 `inference.sh` / `scripts/sugar_rl/play.py`，我们昨晚已经在本机和服务器上都验证过 |
+| **Sim-to-sim** | 把策略从 IsaacSim **迁移到另一个仿真器**（一般是 MuJoCo，更快、更轻量，常用作上真机前的中间验证） | ❌ 没开源，README TODO 里明确写着 |
+| **Sim-to-real** | 部署到 **真实 G1 机器人** | ❌ 不在这个仓库范围内，需要自己接 Unitree SDK/低层控制 |
+
+所以结论是：**能 play，而且现在就能跑**——只是这个"play"是在 IsaacSim 内部看效果，不等于能直接一键部署到 MuJoCo 或者真机。要往真机走，中间那层 sim-to-sim（策略怎么从 IsaacSim 的观测/动作空间对齐到 MuJoCo/真实关节控制）需要你自己搭，这部分可以复用你之前 SONIC/G1/Bumi 项目里积累的 sim2sim/sim2real 经验，不是从零开始。
+
+### 7.2 部署官方已训练好的策略（demo_ckpts，现在就能跑）
+
+```bash
+# 本机（有 DISPLAY，能看 GUI 窗口）
+source /home/yingchaomu/下载/sugar-venv/bin/activate
+export OMNI_KIT_ACCEPT_EULA=Y
+cd /home/yingchaomu/下载/SUGAR
+bash inference.sh CarryBox        # 去掉 --headless，会弹 IsaacSim 窗口
+```
+
+```bash
+# 服务器（无 DISPLAY，headless，用 --video 录成 mp4 带回本机看）
+ssh Noetix-0
+source /root/miniconda3/etc/profile.d/conda.sh && conda activate sugar
+export OMNI_KIT_ACCEPT_EULA=Y
+cd /data0/SUGAR_repro/SUGAR
+python scripts/sugar_rl/play.py --task Sugar-G129dof-CarryBox-Inference \
+    --checkpoint demo_ckpts/CarryBox/tracker.pt \
+    --generator_checkpoint demo_ckpts/CarryBox/generator.ckpt \
+    --motion_folder data/CarryBox \
+    --num_envs 4 --eval_random_motion --eval_max_time 500 \
+    --video --video_length 500 \
+    --headless
+# 视频存在 demo_ckpts/CarryBox/videos/play/（log_dir 是 checkpoint 所在目录）
+```
+
+`--eval_max_time` 给回合设一个明确的步数上限，跑完自己退出，不用再靠外部 `timeout` 硬杀（我们昨晚那次本机测试就是因为没设这个，最后被 `timeout` 杀掉触发了一个无害的 `carb.tasking` assertion）。六个任务名：`CarryBox / KickBox / PushBox / PickBottle / StandBottle / SitChair`，`inference.sh` 直接换第一个参数即可。
+
+把视频取回本机看：
+
+```bash
+scp -i /home/yingchaomu/下载/Noetix-2-7.pem \
+  root@118.196.95.17:/data0/SUGAR_repro/SUGAR/demo_ckpts/CarryBox/videos/play/*.mp4 \
+  /home/yingchaomu/下载/
+```
+
+### 7.3 部署我们自己训出来的策略（训练还没跑完，命令先准备好）
+
+`train.sh` 跑完一个任务后，`tracker.pt`/`generator.ckpt` 落在：
+
+```text
+outputs/{TASK}_server_repro/ckpts/tracker.pt
+outputs/{TASK}_server_repro/ckpts/generator.ckpt
+```
+
+`inference.sh` 支持传第 2/3 个参数指定 checkpoint 路径（不传就用 `demo_ckpts` 默认值），所以跑我们自己的策略就是：
+
+```bash
+ssh Noetix-0
+source /root/miniconda3/etc/profile.d/conda.sh && conda activate sugar
+export OMNI_KIT_ACCEPT_EULA=Y
+cd /data0/SUGAR_repro/SUGAR
+bash inference.sh CarryBox \
+  outputs/CarryBox_server_repro/ckpts/tracker.pt \
+  outputs/CarryBox_server_repro/ckpts/generator.ckpt
+```
+
+想要 headless + 录视频 + 用自己的 checkpoint，就是把 7.2 服务器那条命令里的 `--checkpoint`/`--generator_checkpoint` 换成上面这两个路径，`--video` 存放路径也会跟着变成 `outputs/CarryBox_server_repro/ckpts/videos/play/`。
+
+想把训完的 checkpoint 拉回本机（比如要接你自己的 sim2sim/sim2real pipeline）：
+
+```bash
+rsync -ah -e "ssh -i /home/yingchaomu/下载/Noetix-2-7.pem" \
+  root@118.196.95.17:/data0/SUGAR_repro/SUGAR/outputs/CarryBox_server_repro/ckpts/ \
+  /home/yingchaomu/下载/SUGAR/outputs/CarryBox_server_repro/ckpts/
+```
+
+**现在能跑这条命令的前提**：`train.sh` 对应任务要跑完全部三个阶段（Refiner→Tracker→Generator）。目前（见第 6 节）六个任务都还在 Refiner 阶段（50~57%），预计还要 8~12 小时才能进入 Tracker，全部跑完大概还要 1.5~2 天（见 3.4 节的算力估算）。中途也可以用 Refiner/Tracker 阶段各自产出的 rollout 数据做检查，但 `inference.sh` 这条完整推理链路要等 Generator 训完才有意义（它需要 `generator.ckpt`）。
