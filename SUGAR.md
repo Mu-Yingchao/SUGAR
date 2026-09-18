@@ -499,7 +499,21 @@ SitChair       ~0 → 18.3                                  0% → 97.1%
 
 所以结论是：**能 play，而且现在就能跑**——只是这个"play"是在 IsaacSim 内部看效果，不等于能直接一键部署到 MuJoCo 或者真机。要往真机走，中间那层 sim-to-sim（策略怎么从 IsaacSim 的观测/动作空间对齐到 MuJoCo/真实关节控制）需要你自己搭，这部分可以复用你之前 SONIC/G1/Bumi 项目里积累的 sim2sim/sim2real 经验，不是从零开始。
 
-### 7.2 部署官方已训练好的策略（demo_ckpts，现在就能跑）
+### 7.2 开源状态总览：官方开源了什么、没开源什么、我们复现了什么
+
+| 环节 | 官方开源？ | 我们的状态 |
+|---|---|---|
+| Refiner/Tracker/Generator 训练代码 | ✅ | ✅ 已跑通，六任务在服务器训练中（见第 6 节） |
+| 六任务 processed 训练数据 | ✅ | ✅ 已下载，本机+服务器都有 |
+| demo_ckpts（六任务训好的 tracker+generator） | ✅ | ✅ 已验证能在 IsaacSim 里 play（7.3 节） |
+| RGB-D 视频 → 训练数据 pipeline（人体/物体重建、VLM contact、FoundationPose） | ❌ | 不需要——我们直接用官方 processed data，不用自己录视频重新生成 |
+| Sim-to-sim（IsaacSim → MuJoCo） | ❌ | ✅ 我们自己写了，`sugar_deploy`，用官方 demo_ckpts 验证过数据流跑得通、物理稳定，但机器人还没站稳（7.5 节） |
+| Sim-to-real（MuJoCo/IsaacSim → 真实 G1，DDS/SDK 通信） | ❌ | ❌ 还没写，`sugar_deploy` 目前只有 MuJoCo 后端 |
+| 真机部署时的物体感知（怎么实时知道箱子在哪） | ❌（论文自己也没解决，见 7.6） | ❌ 还没做，是当前最大的缺口 |
+
+一句话总结现在能做什么：**IsaacSim 内 play（官方策略和我们训出来的都能）+ MuJoCo sim2sim（跑得通，行为还没调对）。真机部署两个硬缺口都还没补：怎么控制机器人（DDS 通信）、怎么让机器人知道物体在哪（感知）。**
+
+### 7.3 部署官方已训练好的策略（demo_ckpts，现在就能跑）
 
 ```bash
 # 本机（有 DISPLAY，能看 GUI 窗口）
@@ -535,7 +549,7 @@ scp -i /home/yingchaomu/下载/Noetix-2-7.pem \
   /home/yingchaomu/下载/
 ```
 
-### 7.3 部署我们自己训出来的策略（训练还没跑完，命令先准备好）
+### 7.4 部署我们自己训出来的策略（训练还没跑完，命令先准备好）
 
 `train.sh` 跑完一个任务后，`tracker.pt`/`generator.ckpt` 落在：
 
@@ -568,7 +582,7 @@ rsync -ah -e "ssh -i /home/yingchaomu/下载/Noetix-2-7.pem" \
 
 **现在能跑这条命令的前提**：`train.sh` 对应任务要跑完全部三个阶段（Refiner→Tracker→Generator）。目前（见第 6 节）六个任务都还在 Refiner 阶段（50~57%），预计还要 8~12 小时才能进入 Tracker，全部跑完大概还要 1.5~2 天（见 3.4 节的算力估算）。中途也可以用 Refiner/Tracker 阶段各自产出的 rollout 数据做检查，但 `inference.sh` 这条完整推理链路要等 Generator 训完才有意义（它需要 `generator.ckpt`）。
 
-### 7.4 MuJoCo sim2sim 部署代码：`sugar_deploy`（独立仓库）
+### 7.5 MuJoCo sim2sim 部署代码：`sugar_deploy`（独立仓库）
 
 7.1 节说的"能 play 但没开源 sim-to-sim"——这个缺口已经动手补了一版，单独放在
 `/home/yingchaomu/下载/sugar_deploy`（不塞进 SUGAR 训练仓库，原因和详细说明见它自己的 README）。
@@ -582,3 +596,40 @@ rsync -ah -e "ssh -i /home/yingchaomu/下载/Noetix-2-7.pem" \
 在 `sugar_deploy/contract.py`；Generator 部分直接复用了 SUGAR 自己 `play.py` 在用的
 `GeneratorWrapper`，没有重新实现（过程中发现训练 yaml 写的是 `DDIMScheduler`，但实际推理路径用的是
 `DDPMScheduler`，自己重新拼一遍很容易在这类细节上出错）。
+
+```bash
+source /home/yingchaomu/下载/sugar-venv/bin/activate
+cd /home/yingchaomu/下载/sugar_deploy
+
+# 官方 demo_ckpts
+python scripts/run_sim2sim.py --task CarryBox \
+    --tracker-checkpoint /home/yingchaomu/下载/SUGAR/demo_ckpts/CarryBox/tracker.pt \
+    --generator-checkpoint /home/yingchaomu/下载/SUGAR/demo_ckpts/CarryBox/generator.ckpt \
+    --control-steps 1000   # 本机有 DISPLAY 会弹 MuJoCo 窗口；服务器上加 --headless --no-real-time
+
+# 我们自己训出来的（等 CarryBox 在服务器训完 Generator 之后）
+python scripts/run_sim2sim.py --task CarryBox \
+    --tracker-checkpoint /data0/SUGAR_repro/SUGAR/outputs/CarryBox_server_repro/ckpts/tracker.pt \
+    --generator-checkpoint /data0/SUGAR_repro/SUGAR/outputs/CarryBox_server_repro/ckpts/generator.ckpt \
+    --control-steps 1000
+```
+
+### 7.6 真机部署现状：物体感知这道坎（论文自己也没迈过去）
+
+这是真机部署目前最大、最根本的缺口，写清楚免得后面踩坑。
+
+**论文原话**（Section 4.5，已用 WebFetch 核实过，不是转述）：
+
+> "We deploy our policy on a real humanoid robot using MoCap, transferring the purely simulation-trained model to the real world."
+
+查了论文全文和项目主页，**完全没有提到贴标签/胶带/AprilTag 这类视觉标记方案**——真机部署的物体和机器人状态就是纯外部动作捕捉给的。论文自己把"加视觉 encoder、摆脱 MoCap"列为 future work，说明这不是"SUGAR 没开源某个模块"，是**这篇论文本身就没有解决"机器人自己实时看见物体在哪"这个问题**。demo 视频里箱子上的黄黑胶带，大概率不是喂给策略的感知信号（可能是给人类操作员摆放物体的参照，或者纯粹是视频里让物体轮廓更清楚），但这一点没法从论文文字里 100% 证实，只能说论文明确写的感知方案是 MoCap，不是基于标记的视觉方案。
+
+**没有 MoCap、也不接 AprilTag/ArUco 的话，G1 会怎样**：会动，但不会正确完成任务。原因是物体位姿不是可选输入，是硬编码在 Tracker 的 510 维观测（`obj_pos_b`+`obj_ori_b`=9 维）和 Generator 的观测里的——网络不会因为没有物体数据就拒绝输出，喂什么都会算出一个动作。机器人自身的平衡/行走能力（来自 IMU/关节编码器，不需要外部感知）大概率还在，但涉及"物体在哪、抓没抓住"的决策会基于错误信息，抓取/搬运动作和真实物体对不上，任务基本不会成功。这不是 SUGAR 特有的限制，是任何 object-state-conditioned policy 的通病。
+
+**现实的选项**（按投入产出比排序，`sugar_deploy/object_state.py` 已经把物体状态源设计成可插拔接口 `ObjectStateSource`，换哪种方案都不用动下游代码）：
+
+1. **AprilTag/ArUco + 摄像头**：给物体贴打印标签，用 OpenCV 自带的 ArUco 检测拿到实时 6-DoF 位姿，毫米级精度，学术圈没有 MoCap 时的标准替代方案。G1 本身 `torso_link` 上就挂了一个 D435 深度相机（URDF 里 `d435_joint` 确认过），不用额外买硬件。
+2. **在线跑 FoundationPose**：SUGAR 已经重建好了这几个物体的 mesh（`descriptions/objects/*/obj_aligned.usd`），理论上可以把论文 Stage 1 离线用的 FoundationPose 搬到实时跑在 D435 的 RGB-D 流上，不用贴标记。工作量更大，且搬箱子时手经常遮挡物体，无标记跟踪丢失/漂移是真实风险——这大概率正是论文自己选择用 MoCap 绕开的原因。
+3. **真的上动捕**：论文原始方案，效果最可靠，但需要采购/搭建动捕系统，成本最高。
+
+在没有选定方案之前，`sugar_deploy` 里的 `MocapObjectSource` 会在没收到任何数据时直接报错拒绝跑，不会让机器人带着假数据瞎动——这是有意为之的保守设计，真机部署前必须先把这个接口接到某个真实数据源上。
